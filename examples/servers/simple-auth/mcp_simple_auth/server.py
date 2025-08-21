@@ -81,6 +81,7 @@ def create_resource_server(settings: ResourceServerSettings) -> FastMCP:
             required_scopes=[settings.mcp_scope],
             resource_server_url=settings.server_url,
         ),
+        stateless_http=True,
     )
 
     @app.tool()
