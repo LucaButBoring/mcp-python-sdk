@@ -104,7 +104,9 @@ UnstructuredContent: TypeAlias = Iterable[types.ContentBlock]
 CombinationContent: TypeAlias = tuple[UnstructuredContent, StructuredContent]
 
 # This will be properly typed in each Server instance's context
-request_ctx: contextvars.ContextVar[RequestContext[ServerSession, Any, Any]] = contextvars.ContextVar("request_ctx")
+request_ctx: contextvars.ContextVar[RequestContext[ServerSession, ServerAsyncOperationManager, Any, Any]] = (
+    contextvars.ContextVar("request_ctx")
+)
 
 
 class NotificationOptions:
@@ -132,6 +134,10 @@ async def lifespan(_: Server[LifespanResultT, RequestT]) -> AsyncIterator[dict[s
     yield {}
 
 
+def default_async_operations(_: Server[LifespanResultT, RequestT]) -> ServerAsyncOperationManager:
+    return ServerAsyncOperationManager()
+
+
 class Server(Generic[LifespanResultT, RequestT]):
     def __init__(
         self,
@@ -140,7 +146,7 @@ class Server(Generic[LifespanResultT, RequestT]):
         instructions: str | None = None,
         website_url: str | None = None,
         icons: list[types.Icon] | None = None,
-        async_operations: ServerAsyncOperationManager | None = None,
+        async_operations: Callable[[Server[LifespanResultT, RequestT]], ServerAsyncOperationManager] | None = None,
         lifespan: Callable[
             [Server[LifespanResultT, RequestT]],
             AbstractAsyncContextManager[LifespanResultT],
@@ -152,7 +158,7 @@ class Server(Generic[LifespanResultT, RequestT]):
         self.website_url = website_url
         self.icons = icons
         self.lifespan = lifespan
-        self.async_operations = async_operations or ServerAsyncOperationManager()
+        self.async_operations = async_operations or default_async_operations
         # Track request ID to operation token mapping for cancellation
         self._request_to_operation: dict[RequestId, str] = {}
         self.request_handlers: dict[type, Callable[..., Awaitable[types.ServerResult]]] = {
@@ -239,7 +245,7 @@ class Server(Generic[LifespanResultT, RequestT]):
     @property
     def request_context(
         self,
-    ) -> RequestContext[ServerSession, LifespanResultT, RequestT]:
+    ) -> RequestContext[ServerSession, ServerAsyncOperationManager, LifespanResultT, RequestT]:
         """If called outside of a request context, this will raise a LookupError."""
         return request_ctx.get()
 
@@ -507,7 +513,7 @@ class Server(Generic[LifespanResultT, RequestT]):
                             return self._make_error_result(f"Input validation error: {e.message}")
 
                     # Check for async execution
-                    if tool and self.async_operations and self._should_execute_async(tool):
+                    if tool and self._should_execute_async(tool):
                         keep_alive = self._get_tool_keep_alive(tool)
                         immediate_content: list[types.ContentBlock] = []
 
@@ -528,7 +534,7 @@ class Server(Generic[LifespanResultT, RequestT]):
                                 )
 
                         # Create async operation
-                        operation = self.async_operations.create_operation(
+                        operation = self.request_context.operation_manager.create_operation(
                             tool_name=tool_name,
                             arguments=arguments,
                             keep_alive=keep_alive,
@@ -538,6 +544,7 @@ class Server(Generic[LifespanResultT, RequestT]):
                         # Add the operation token to the request context
                         ctx = RequestContext(
                             request_id=self.request_context.request_id,
+                            operation_manager=self.request_context.operation_manager,
                             operation_token=self.request_context.operation_token,
                             meta=self.request_context.meta,
                             session=self.request_context.session,
@@ -551,17 +558,17 @@ class Server(Generic[LifespanResultT, RequestT]):
                         async def execute_async():
                             try:
                                 logger.debug(f"Starting async execution of {tool_name}")
-                                self.async_operations.mark_working(operation.token)
+                                self.request_context.operation_manager.mark_working(operation.token)
                                 results = await func(tool_name, arguments)
                                 logger.debug(f"Async execution completed for {tool_name}")
 
                                 # Process results using shared logic
                                 result = self._process_tool_result(results, tool)
-                                self.async_operations.complete_operation(operation.token, result)
+                                self.request_context.operation_manager.complete_operation(operation.token, result)
                                 logger.debug(f"Completed async operation {operation.token}")
                             except Exception as e:
                                 logger.exception(f"Async execution failed for {tool_name}")
-                                self.async_operations.fail_operation(operation.token, str(e))
+                                self.request_context.operation_manager.fail_operation(operation.token, str(e))
 
                         async with anyio.create_task_group() as tg:
                             tg.start_soon(execute_async)
@@ -735,7 +742,7 @@ class Server(Generic[LifespanResultT, RequestT]):
 
     def _validate_operation_token(self, token: str) -> ServerAsyncOperation:
         """Validate operation token and return operation if valid."""
-        operation = self.async_operations.get_operation(token)
+        operation = self.request_context.operation_manager.get_operation(token)
         if not operation:
             raise McpError(types.ErrorData(code=-32602, message="Invalid token"))
 
@@ -801,7 +808,7 @@ class Server(Generic[LifespanResultT, RequestT]):
         if request_id in self._request_to_operation:
             token = self._request_to_operation[request_id]
             # Cancel the operation
-            if self.async_operations.cancel_operation(token):
+            if self.request_context.operation_manager.cancel_operation(token):
                 logger.debug(f"Cancelled async operation {token} for request {request_id}")
             # Clean up the mapping
             del self._request_to_operation[request_id]
@@ -815,7 +822,7 @@ class Server(Generic[LifespanResultT, RequestT]):
     def send_request_for_operation(self, token: str, request: types.ServerRequest) -> None:
         """Send a request associated with an async operation."""
         # Mark operation as requiring input
-        if self.async_operations.mark_input_required(token):
+        if self.request_context.operation_manager.mark_input_required(token):
             # Add operation token to request
             if hasattr(request.root, "params") and request.root.params is not None:
                 if not hasattr(request.root.params, "operation") or request.root.params.operation is None:
@@ -825,7 +832,7 @@ class Server(Generic[LifespanResultT, RequestT]):
     def send_notification_for_operation(self, token: str, notification: types.ServerNotification) -> None:
         """Send a notification associated with an async operation."""
         # Mark operation as requiring input
-        if self.async_operations.mark_input_required(token):
+        if self.request_context.operation_manager.mark_input_required(token):
             # Add operation token to notification
             if hasattr(notification.root, "params") and notification.root.params is not None:
                 if not hasattr(notification.root.params, "operation") or notification.root.params.operation is None:
@@ -834,7 +841,7 @@ class Server(Generic[LifespanResultT, RequestT]):
 
     def complete_request_for_operation(self, token: str) -> None:
         """Mark that a request for an operation has been completed."""
-        if self.async_operations.mark_input_completed(token):
+        if self.request_context.operation_manager.mark_input_completed(token):
             logger.debug(f"Marked operation {token} as no longer requiring input")
 
     async def run(
@@ -863,33 +870,26 @@ class Server(Generic[LifespanResultT, RequestT]):
                     stateless=stateless,
                 )
             )
+            operation_manager = await stack.enter_async_context(self.async_operations(self))
 
-            # Start async operations cleanup task
-            await self.async_operations.start_cleanup_task()
+            async with anyio.create_task_group() as tg:
+                async for message in session.incoming_messages:
+                    logger.debug("Received message: %s", message)
 
-            try:
-                async with anyio.create_task_group() as tg:
-                    async for message in session.incoming_messages:
-                        logger.debug("Received message: %s", message)
-
-                        tg.start_soon(
-                            self._handle_message,
-                            message,
-                            session,
-                            lifespan_context,
-                            raise_exceptions,
-                        )
-            finally:
-                # Cancel session operations and stop cleanup task
-                session_id = getattr(session, "session_id", None)
-                if session_id is not None:
-                    self.async_operations.cancel_session_operations(session_id)
-                await self.async_operations.stop_cleanup_task()
+                    tg.start_soon(
+                        self._handle_message,
+                        message,
+                        session,
+                        operation_manager,
+                        lifespan_context,
+                        raise_exceptions,
+                    )
 
     async def _handle_message(
         self,
         message: RequestResponder[types.ClientRequest, types.ServerResult] | types.ClientNotification | Exception,
         session: ServerSession,
+        operation_manager: ServerAsyncOperationManager,
         lifespan_context: LifespanResultT,
         raise_exceptions: bool = False,
     ):
@@ -898,7 +898,9 @@ class Server(Generic[LifespanResultT, RequestT]):
             match message:  # type: ignore[reportMatchNotExhaustive]
                 case RequestResponder(request=types.ClientRequest(root=req)) as responder:
                     with responder:
-                        await self._handle_request(message, req, session, lifespan_context, raise_exceptions)
+                        await self._handle_request(
+                            message, req, session, operation_manager, lifespan_context, raise_exceptions
+                        )
                 case types.ClientNotification(root=notify):
                     await self._handle_notification(notify)
 
@@ -910,6 +912,7 @@ class Server(Generic[LifespanResultT, RequestT]):
         message: RequestResponder[types.ClientRequest, types.ServerResult],
         req: Any,
         session: ServerSession,
+        operation_manager: ServerAsyncOperationManager,
         lifespan_context: LifespanResultT,
         raise_exceptions: bool,
     ):
@@ -929,6 +932,7 @@ class Server(Generic[LifespanResultT, RequestT]):
                 context_token = request_ctx.set(
                     RequestContext(
                         request_id=message.request_id,
+                        operation_manager=operation_manager,
                         operation_token=message.operation.token if message.operation else None,
                         meta=message.request_meta,
                         session=session,

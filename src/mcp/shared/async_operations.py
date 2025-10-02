@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-import asyncio
+import logging
 import secrets
 import time
 from collections.abc import Callable
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
-from typing import Any, Generic, TypeVar
+from types import TracebackType
+from typing import Any, Generic, Self, TypeVar
+
+import anyio
 
 import mcp.types as types
 from mcp.types import AsyncOperationStatus
@@ -66,8 +70,8 @@ class BaseOperationManager(Generic[OperationT]):
 
     def __init__(self, *, token_generator: Callable[[str | None], str] | None = None):
         self._operations: dict[str, OperationT] = {}
-        self._cleanup_task: asyncio.Task[None] | None = None
         self._cleanup_interval = 60  # Cleanup every 60 seconds
+        self._exit_stack = AsyncExitStack()
         self._token_generator = token_generator or self._default_token_generator
 
     def _default_token_generator(self, session_id: str | None = None) -> str:
@@ -105,31 +109,30 @@ class BaseOperationManager(Generic[OperationT]):
             self._remove_operation(token)
         return len(expired_tokens)
 
-    async def start_cleanup_task(self) -> None:
-        """Start the background cleanup task."""
-        if self._cleanup_task is None:
-            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+    async def __aenter__(self) -> Self:
+        await self._exit_stack.__aenter__()
+        self._cleanup_task_group = anyio.create_task_group()
+        await self._cleanup_task_group.__aenter__()
+        self._cleanup_task_group.start_soon(self._cleanup_loop)
+        return self
 
-    async def stop_cleanup_task(self) -> None:
-        """Stop the background cleanup task."""
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
-            self._cleanup_task = None
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> bool | None:
+        await self._exit_stack.aclose()
+        self._cleanup_task_group.cancel_scope.cancel()
+        return await self._cleanup_task_group.__aexit__(exc_type, exc_val, exc_tb)
 
     async def _cleanup_loop(self) -> None:
         """Background task to clean up expired operations."""
         while True:
-            try:
-                await asyncio.sleep(self._cleanup_interval)
-                count = self.cleanup_expired()
-                if count > 0:
-                    print(f"Cleaned up {count} expired operations")
-            except asyncio.CancelledError:
-                break
+            await anyio.sleep(self._cleanup_interval)
+            count = self.cleanup_expired()
+            if count > 0:
+                logging.debug(f"Cleaned up {count} expired operations")
 
 
 class ClientAsyncOperationManager(BaseOperationManager[ClientAsyncOperation]):
@@ -292,32 +295,3 @@ class ServerAsyncOperationManager(BaseOperationManager[ServerAsyncOperation]):
 
         operation.status = "working"
         return True
-
-    async def start_cleanup_task(self) -> None:
-        """Start the background cleanup task."""
-        if self._cleanup_task is not None:
-            return
-
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-
-    async def stop_cleanup_task(self) -> None:
-        """Stop the background cleanup task."""
-        if self._cleanup_task is not None:
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
-            self._cleanup_task = None
-
-    async def _cleanup_loop(self) -> None:
-        """Background cleanup loop."""
-        while True:
-            try:
-                await asyncio.sleep(self._cleanup_interval)
-                self.cleanup_expired_operations()
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                # Log error but continue cleanup loop
-                pass

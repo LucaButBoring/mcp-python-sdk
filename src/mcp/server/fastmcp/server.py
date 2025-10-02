@@ -35,7 +35,7 @@ from mcp.server.fastmcp.tools.base import InvocationMode
 from mcp.server.fastmcp.utilities.context_injection import find_context_parameter
 from mcp.server.fastmcp.utilities.logging import configure_logging, get_logger
 from mcp.server.lowlevel.helper_types import ReadResourceContents
-from mcp.server.lowlevel.server import LifespanResultT
+from mcp.server.lowlevel.server import LifespanResultT, default_async_operations
 from mcp.server.lowlevel.server import Server as MCPServer
 from mcp.server.lowlevel.server import lifespan as default_lifespan
 from mcp.server.session import ServerSession, ServerSessionT
@@ -131,6 +131,16 @@ def lifespan_wrapper(
     return wrap
 
 
+def async_operations_wrapper(
+    app: FastMCP[LifespanResultT],
+    async_operations: Callable[[FastMCP[LifespanResultT]], ServerAsyncOperationManager],
+) -> Callable[[MCPServer[LifespanResultT, Request]], ServerAsyncOperationManager]:
+    def wrap(_: MCPServer[LifespanResultT, Request]) -> ServerAsyncOperationManager:
+        return async_operations(app)
+
+    return wrap
+
+
 class FastMCP(Generic[LifespanResultT]):
     _tool_manager: ToolManager
 
@@ -144,7 +154,7 @@ class FastMCP(Generic[LifespanResultT]):
         token_verifier: TokenVerifier | None = None,
         event_store: EventStore | None = None,
         *,
-        async_operations: ServerAsyncOperationManager | None = None,
+        async_operations: Callable[[FastMCP[LifespanResultT]], ServerAsyncOperationManager] | None = None,
         tools: list[Tool] | None = None,
         debug: bool = False,
         log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO",
@@ -184,14 +194,14 @@ class FastMCP(Generic[LifespanResultT]):
             transport_security=transport_security,
         )
 
-        self._async_operations = async_operations or ServerAsyncOperationManager()
-
         self._mcp_server = MCPServer(
             name=name or "FastMCP",
             instructions=instructions,
             website_url=website_url,
             icons=icons,
-            async_operations=self._async_operations,
+            async_operations=(
+                async_operations_wrapper(self, async_operations) if async_operations else default_async_operations
+            ),  # type: ignore,
             # TODO(Marcelo): It seems there's a type mismatch between the lifespan type from an FastMCP and Server.
             # We need to create a Lifespan type that is a generic on the server type, like Starlette does.
             lifespan=(lifespan_wrapper(self, self.settings.lifespan) if self.settings.lifespan else default_lifespan),  # type: ignore
@@ -297,7 +307,6 @@ class FastMCP(Generic[LifespanResultT]):
         self._mcp_server.list_resource_templates()(self.list_resource_templates)
 
         # Register async operation handlers
-        logger.info(f"Async operations manager: {self._async_operations}")
         logger.info("Registering async operation handlers")
         self._mcp_server.get_operation_status()(self.get_operation_status)
         self._mcp_server.get_operation_result()(self.get_operation_result)
@@ -305,7 +314,8 @@ class FastMCP(Generic[LifespanResultT]):
     async def get_operation_status(self, token: str) -> GetOperationStatusResult:
         """Get the status of an async operation."""
         try:
-            operation = self._async_operations.get_operation(token)
+            operation_manager = self.get_context().request_context.operation_manager
+            operation = operation_manager.get_operation(token)
             if not operation:
                 raise ValueError(f"Operation not found: {token}")
 
@@ -320,7 +330,8 @@ class FastMCP(Generic[LifespanResultT]):
     async def get_operation_result(self, token: str) -> GetOperationPayloadResult:
         """Get the result of a completed async operation."""
         try:
-            operation = self._async_operations.get_operation(token)
+            operation_manager = self.get_context().request_context.operation_manager
+            operation = operation_manager.get_operation(token)
             if not operation:
                 raise ValueError(f"Operation not found: {token}")
 
@@ -1228,13 +1239,15 @@ class Context(BaseModel, Generic[ServerSessionT, LifespanContextT, RequestT]):
     The context is optional - tools that don't need it can omit the parameter.
     """
 
-    _request_context: RequestContext[ServerSessionT, LifespanContextT, RequestT] | None
+    _request_context: RequestContext[ServerSessionT, ServerAsyncOperationManager, LifespanContextT, RequestT] | None
     _fastmcp: FastMCP | None
 
     def __init__(
         self,
         *,
-        request_context: (RequestContext[ServerSessionT, LifespanContextT, RequestT] | None) = None,
+        request_context: (
+            RequestContext[ServerSessionT, ServerAsyncOperationManager, LifespanContextT, RequestT] | None
+        ) = None,
         fastmcp: FastMCP | None = None,
         **kwargs: Any,
     ):
@@ -1252,7 +1265,7 @@ class Context(BaseModel, Generic[ServerSessionT, LifespanContextT, RequestT]):
     @property
     def request_context(
         self,
-    ) -> RequestContext[ServerSessionT, LifespanContextT, RequestT]:
+    ) -> RequestContext[ServerSessionT, ServerAsyncOperationManager, LifespanContextT, RequestT]:
         """Access to the underlying request context."""
         if self._request_context is None:
             raise ValueError("Context is not available outside of a request")

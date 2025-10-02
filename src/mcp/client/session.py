@@ -1,6 +1,7 @@
 import logging
 from datetime import timedelta
-from typing import Any, Protocol
+from types import TracebackType
+from typing import Any, Protocol, Self
 
 import anyio
 import anyio.lowlevel
@@ -23,7 +24,7 @@ logger = logging.getLogger("client")
 class SamplingFnT(Protocol):
     async def __call__(
         self,
-        context: RequestContext["ClientSession", Any],
+        context: RequestContext["ClientSession", ClientAsyncOperationManager, Any],
         params: types.CreateMessageRequestParams,
     ) -> types.CreateMessageResult | types.ErrorData: ...
 
@@ -31,14 +32,14 @@ class SamplingFnT(Protocol):
 class ElicitationFnT(Protocol):
     async def __call__(
         self,
-        context: RequestContext["ClientSession", Any],
+        context: RequestContext["ClientSession", ClientAsyncOperationManager, Any],
         params: types.ElicitRequestParams,
     ) -> types.ElicitResult | types.ErrorData: ...
 
 
 class ListRootsFnT(Protocol):
     async def __call__(
-        self, context: RequestContext["ClientSession", Any]
+        self, context: RequestContext["ClientSession", ClientAsyncOperationManager, Any]
     ) -> types.ListRootsResult | types.ErrorData: ...
 
 
@@ -63,7 +64,7 @@ async def _default_message_handler(
 
 
 async def _default_sampling_callback(
-    context: RequestContext["ClientSession", Any],
+    context: RequestContext["ClientSession", ClientAsyncOperationManager, Any],
     params: types.CreateMessageRequestParams,
 ) -> types.CreateMessageResult | types.ErrorData:
     return types.ErrorData(
@@ -73,7 +74,7 @@ async def _default_sampling_callback(
 
 
 async def _default_elicitation_callback(
-    context: RequestContext["ClientSession", Any],
+    context: RequestContext["ClientSession", ClientAsyncOperationManager, Any],
     params: types.ElicitRequestParams,
 ) -> types.ElicitResult | types.ErrorData:
     return types.ErrorData(
@@ -83,7 +84,7 @@ async def _default_elicitation_callback(
 
 
 async def _default_list_roots_callback(
-    context: RequestContext["ClientSession", Any],
+    context: RequestContext["ClientSession", ClientAsyncOperationManager, Any],
 ) -> types.ListRootsResult | types.ErrorData:
     return types.ErrorData(
         code=types.INVALID_REQUEST,
@@ -176,14 +177,19 @@ class ClientSession(
 
         await self.send_notification(types.ClientNotification(types.InitializedNotification()))
 
-        # Start cleanup task for operations
-        await self._operation_manager.start_cleanup_task()
-
         return result
 
-    async def close(self) -> None:
+    async def __aenter__(self) -> Self:
+        # Start cleanup task for operations
+        await self._operation_manager.__aenter__()
+        return await super().__aenter__()
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: TracebackType | None
+    ) -> bool | None:
         """Clean up resources."""
-        await self._operation_manager.stop_cleanup_task()
+        await self._operation_manager.__aexit__(exc_type, exc_val, exc_tb)
+        return await super().__aexit__(exc_type, exc_val, exc_tb)
 
     async def send_ping(self) -> types.EmptyResult:
         """Send a ping request."""
@@ -464,8 +470,9 @@ class ClientSession(
         await self.send_notification(types.ClientNotification(types.RootsListChangedNotification()))
 
     async def _received_request(self, responder: RequestResponder[types.ServerRequest, types.ClientResult]) -> None:
-        ctx = RequestContext[ClientSession, Any](
+        ctx = RequestContext[ClientSession, ClientAsyncOperationManager, Any](
             request_id=responder.request_id,
+            operation_manager=self._operation_manager,
             operation_token=responder.operation.token if responder.operation is not None else None,
             meta=responder.request_meta,
             session=self,
